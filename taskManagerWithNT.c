@@ -1,6 +1,36 @@
 /*
   Date: 20-Jan-2026
   Task Manager recreation with NT APIs
+
+  structure form my winternl.h check your you may have WaitTime member inside STI struct
+    typedef struct _SYSTEM_THREAD_INFORMATION {
+    LARGE_INTEGER Reserved1[3];
+    ULONG Reserved2;
+    PVOID StartAddress;
+    CLIENT_ID ClientId;
+    KPRIORITY Priority;
+    LONG BasePriority;
+    ULONG Reserved3;
+    ULONG ThreadState;
+    ULONG WaitReason;
+  } SYSTEM_THREAD_INFORMATION, *PSYSTEM_THREAD_INFORMATION;
+But in NtQueryInformationThread has member call ThreadInformationClass ->ThreadTImes
+
+  typedef struct _SYSTEM_THREADS 
+  {
+  LARGE_INTEGER KernelTime;
+  LARGE_INTEGER UserTime;
+  LARGE_INTEGER CreateTime;
+  ULONG WaitTime;
+  PVOID StartAddress;
+  CLIENT_ID ClientId;
+  KPRIORITY Priority;
+  KPRIORITY BasePriority;
+  ULONG ContextSwitchCount;
+  THREAD_STATE State;
+  KWAIT_REASON WaitReason;
+  } SYSTEM_THREADS, *PSYSTEM_THREADS;
+  
  */
 
 #include <stdio.h>
@@ -37,6 +67,67 @@ void callNtQueryInformationProcess(HANDLE hProcess, PROCESSINFOCLASS ProcessInfo
     }
 }
 
+const char* printThreadState(ULONG state){
+    static const char* states[] = {
+        "Initialized", "Ready", "Running", "Standby",
+        "Terminated", "Waiting", "Transition", "DeferredReady",
+    };
+
+    if(state <= 7){
+        return states[state];
+    }
+    
+    return "Unknown";
+}
+
+void printWaitReason(ULONG waitRNum){
+    const char* waitReason[] = {
+        "Executive", "FreePage", "PageIn", "PoolAllocation", "DelayExecution",
+        "Suspended", "UserRequest", "WrExecutive", "WrFreePage", "WrPageIn",
+        "WrPoolAllocation", "WrDelayExecution", "WrSuspended", "WrUserRequest",
+        "WrEventPair", "WrQueue", "WrLpcReceive","WrLpcReply",
+        "WrVirtualMemory", "WrPageOut", "WrRendezvous",
+        "Spare2", "Spare3",  "Spare4", "Spare5", "Spare6", "WrKernel",
+        "MaximumWaitReason"
+    };
+    if(waitRNum > 27){
+        wprintf(L" \x1b[35mWaitReason:\x1b[0m Unknown\n");
+    }else{
+        wprintf(L" \x1b[35mWaitReason:\x1b[0m %s\n", waitReason[waitRNum]);
+    }
+}
+
+/* void analyzeWaitTime(ULONG waitTime){ */
+/*     if(waitTime > 0){ */
+/*         DWORD hours = waitTime / 3600000; */
+/*         DWORD minutes = (waitTime % 3600000) / 60000; */
+/*         DWORD seconds = (waitTime % 60000) / 1000; */
+/*         DWORD ms = waitTime % 1000; */
+
+/*         printf("\x1b[34mWaitTime:\x1b[0m "); */
+/*         if(hours > 0) printf("%luh:", hours); */
+/*         if(minutes > 0) printf("%lum:", minutes); */
+/*         if(seconds > 0) printf("%lus:", seconds); */
+/*         printf("%lums:\n", ms); */
+/*     } */
+/* } */
+
+
+void detailThreadsInformation(SYSTEM_THREAD_INFORMATION *sti, ULONG n_Threads){
+    for(ULONG i = 0; i < n_Threads; i++){
+        wprintf(L" \x1b[36mThreadID:\x1b[0m %-7lu ",
+                (DWORD)(ULONG_PTR) sti[i].ClientId.UniqueThread);
+        const wchar_t* stateString =
+            (const wchar_t*)printThreadState(sti[i].ThreadState);
+        wprintf(L" \x1b[32mState:\x1b[0m %hs ", stateString);
+        if(sti[i].ThreadState == 5){
+            printWaitReason(sti[i].WaitReason);
+        }else{
+            wprintf(L"\n");
+        }
+        /* analyzeWaitTime(sti[i].WaitTime); //WaitTime not a member Fk */
+    }
+}
 
 int main(){
 
@@ -70,7 +161,13 @@ int main(){
         DWORD pid = (DWORD)(ULONG_PTR)spi->UniqueProcessId;
         ULONG n_Threads = spi->NumberOfThreads;
         
-        printf(" \x1b[32mPID:\x1b[0m %-6lu \x1b[36mThreads:\x1b[0m %-4lu ", pid, n_Threads);
+        printf(" \x1b[32mPID:\x1b[0m %-6lu \x1b[36mThreads:\x1b[0m %-4lu \n", pid, n_Threads);
+
+        PSYSTEM_THREAD_INFORMATION sti = (PSYSTEM_THREAD_INFORMATION)(spi + 1);
+        detailThreadsInformation(sti, n_Threads);
+
+        printf("\n");
+        
         if(spi->ImageName.Buffer && spi->ImageName.Length > 0){
             wprintf(L" \x1b[34mImageName:\x1b[0m %.*ls \n",
                     spi->ImageName.Length / sizeof(WCHAR),
