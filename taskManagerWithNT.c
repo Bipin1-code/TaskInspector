@@ -1,36 +1,6 @@
 /*
-  Date: 20-Jan-2026
+  Date: 20-Jan-2026 + 21-Jan-2026
   Task Manager recreation with NT APIs
-
-  structure form my winternl.h check your you may have WaitTime member inside STI struct
-    typedef struct _SYSTEM_THREAD_INFORMATION {
-    LARGE_INTEGER Reserved1[3];
-    ULONG Reserved2;
-    PVOID StartAddress;
-    CLIENT_ID ClientId;
-    KPRIORITY Priority;
-    LONG BasePriority;
-    ULONG Reserved3;
-    ULONG ThreadState;
-    ULONG WaitReason;
-  } SYSTEM_THREAD_INFORMATION, *PSYSTEM_THREAD_INFORMATION;
-But in NtQueryInformationThread has member call ThreadInformationClass ->ThreadTImes
-
-  typedef struct _SYSTEM_THREADS 
-  {
-  LARGE_INTEGER KernelTime;
-  LARGE_INTEGER UserTime;
-  LARGE_INTEGER CreateTime;
-  ULONG WaitTime;
-  PVOID StartAddress;
-  CLIENT_ID ClientId;
-  KPRIORITY Priority;
-  KPRIORITY BasePriority;
-  ULONG ContextSwitchCount;
-  THREAD_STATE State;
-  KWAIT_REASON WaitReason;
-  } SYSTEM_THREADS, *PSYSTEM_THREADS;
-  
  */
 
 #include <stdio.h>
@@ -45,6 +15,20 @@ extern NTSTATUS NTAPI NtOpenProcess(
                                     PCLIENT_ID ClientId
                                     );
 
+static const char* states[] = {
+    "Initialized", "Ready", "Running", "Standby",
+    "Terminated", "Waiting", "Transition", "DeferredReady",
+};
+
+static const char* waitReason[] = {
+    "Executive", "FreePage", "PageIn", "PoolAllocation", "DelayExecution",
+    "Suspended", "UserRequest", "WrExecutive", "WrFreePage", "WrPageIn",
+    "WrPoolAllocation", "WrDelayExecution", "WrSuspended", "WrUserRequest",
+    "WrEventPair", "WrQueue", "WrLpcReceive","WrLpcReply",
+    "WrVirtualMemory", "WrPageOut", "WrRendezvous",
+    "Spare2", "Spare3",  "Spare4", "Spare5", "Spare6", "WrKernel",
+    "MaximumWaitReason"
+};
 
 void callNtQueryInformationProcess(HANDLE hProcess, PROCESSINFOCLASS ProcessInformationClass){
     PROCESS_BASIC_INFORMATION pbi; //intentionally not using EX version
@@ -67,35 +51,72 @@ void callNtQueryInformationProcess(HANDLE hProcess, PROCESSINFOCLASS ProcessInfo
     }
 }
 
-const char* printThreadState(ULONG state){
-    static const char* states[] = {
-        "Initialized", "Ready", "Running", "Standby",
-        "Terminated", "Waiting", "Transition", "DeferredReady",
-    };
+void printThreadState(ULONG state){
 
-    if(state <= 7){
-        return states[state];
+    if(state <= ARRAYSIZE(states)){
+        wprintf(L" \x1b[32mState:\x1b[0m %hs ", states[state]);
+    }else{
+        wprintf(L" \x1b[32mState:\x1b[0m  Unknown "); 
     }
-    
-    return "Unknown";
 }
 
 void printWaitReason(ULONG waitRNum){
-    const char* waitReason[] = {
-        "Executive", "FreePage", "PageIn", "PoolAllocation", "DelayExecution",
-        "Suspended", "UserRequest", "WrExecutive", "WrFreePage", "WrPageIn",
-        "WrPoolAllocation", "WrDelayExecution", "WrSuspended", "WrUserRequest",
-        "WrEventPair", "WrQueue", "WrLpcReceive","WrLpcReply",
-        "WrVirtualMemory", "WrPageOut", "WrRendezvous",
-        "Spare2", "Spare3",  "Spare4", "Spare5", "Spare6", "WrKernel",
-        "MaximumWaitReason"
-    };
-    if(waitRNum > 27){
+   
+    if(waitRNum >= ARRAYSIZE(waitReason)){
         wprintf(L" \x1b[35mWaitReason:\x1b[0m Unknown\n");
     }else{
         wprintf(L" \x1b[35mWaitReason:\x1b[0m %s\n", waitReason[waitRNum]);
     }
 }
+
+const char* getBasePriorityName(LONG basePriority){
+    switch(basePriority){
+        case 1: return "IDLE";
+        case 4:  return "LOWEST";
+        case 6:  return "BELOW_NORMAL";
+        case 8:  return "NORMAL";
+        case 10: return "ABOVE_NORMAL";
+        case 15: return "HIGHEST";
+        case 31: return "TIME_CRITICAL";
+        default: return "UNKNOWN";   
+    }
+}
+
+//Drop this idea now
+//Wait Time idea:
+
+//Thread Key (identity)
+/* typedef struct{ */
+/*     DWORD pid; //ProcessID */
+/*     DWORD tid; //ThreadID */
+/* } THREAD_KEY; */
+
+
+/* //Per-thread state */
+/* typedef struct{ */
+/*     THREAD_KEY key; */
+    
+/*     ULONG lastThreadState; */
+/*     ULONG lastWaitReason; */
+    
+/*     ULONGLONG lastTimestamp; */
+/*     ULONGLONG totalWaitTime; */
+
+/*     ULONGLONG lastKernelTIme; */
+/*     ULONGLONG lastUserTime; */
+
+/*     ULONG lastSeenEpoch;  */
+    
+/* } THREAD_RECORD; */
+
+/* //Global tracker */
+/* typedef struct{ */
+/*     THREAD_RECORD *threads; */
+/*     size_t count; */
+/*     size_t capacity; */
+
+/*     ULONG currentEpoch; */
+/* } THREAD_TRACKER; */
 
 /* void analyzeWaitTime(ULONG waitTime){ */
 /*     if(waitTime > 0){ */
@@ -112,19 +133,50 @@ void printWaitReason(ULONG waitRNum){
 /*     } */
 /* } */
 
+/* void fillThreadRecord(THREAD_RECORD *trackerThreads, DWORD pid, DWORD tid, ULONG tState, ULONG wReason){ */
+/*     trackerThreads->key.pid = pid; */
+/*     trackerThreads->key.tid = tid; */
+/*     //Don't have sufficient and stable infromation provided by NT      */
+/* } */
 
-void detailThreadsInformation(SYSTEM_THREAD_INFORMATION *sti, ULONG n_Threads){
+void detailThreadsInformation(SYSTEM_THREAD_INFORMATION *sti, DWORD pid, ULONG n_Threads){
+
+    /* THREAD_TRACKER tracker = {0}; */
+    /* tracker.count = 0; */
+    /* tracker.capacity = n_Threads; */
+    (void)pid;
+    
     for(ULONG i = 0; i < n_Threads; i++){
-        wprintf(L" \x1b[36mThreadID:\x1b[0m %-7lu ",
-                (DWORD)(ULONG_PTR) sti[i].ClientId.UniqueThread);
-        const wchar_t* stateString =
-            (const wchar_t*)printThreadState(sti[i].ThreadState);
-        wprintf(L" \x1b[32mState:\x1b[0m %hs ", stateString);
-        if(sti[i].ThreadState == 5){
-            printWaitReason(sti[i].WaitReason);
+
+        DWORD tid = (DWORD)(ULONG_PTR) sti[i].ClientId.UniqueThread;
+        wprintf(L" \x1b[36mThreadID:\x1b[0m %-7lu ", tid);
+
+        ULONG threadState = sti[i].ThreadState;
+        printThreadState(threadState);
+
+        //Not meaningfull
+        // printf(" \x1b[34mStartAddress:\x1b[0m %p  ", (void*)sti[i].StartAddress);
+        
+
+        LONG basePriority = sti[i].BasePriority;
+        float dynamicPriority = (float)sti[i].Priority;
+        float dynamicPriorityPercent = (dynamicPriority * 100.0f) / 32.0f;
+        printf("\x1b[33mKPriority:\x1b[0m %.1f%%\x1b[33m BasePriority:\x1b[0m %s",
+                dynamicPriorityPercent,
+                getBasePriorityName(basePriority));
+
+        ULONG waitReason = sti[i].WaitReason;
+       
+        //5 means waiting and 6 means Transition
+        if(threadState == 5 || threadState == 6){
+            if(threadState == 5){
+                printWaitReason(waitReason);
+            }
+            /* fillThreadRecord(&tracker.threads[i], pid, tid, threadState, waitReason,); */
         }else{
             wprintf(L"\n");
         }
+        
         /* analyzeWaitTime(sti[i].WaitTime); //WaitTime not a member Fk */
     }
 }
@@ -163,11 +215,12 @@ int main(){
         
         printf(" \x1b[32mPID:\x1b[0m %-6lu \x1b[36mThreads:\x1b[0m %-4lu \n", pid, n_Threads);
 
+        //Threads Details Info
         PSYSTEM_THREAD_INFORMATION sti = (PSYSTEM_THREAD_INFORMATION)(spi + 1);
-        detailThreadsInformation(sti, n_Threads);
-
+        detailThreadsInformation(sti, pid, n_Threads);
         printf("\n");
         
+        //Name of the file the process belongs
         if(spi->ImageName.Buffer && spi->ImageName.Length > 0){
             wprintf(L" \x1b[34mImageName:\x1b[0m %.*ls \n",
                     spi->ImageName.Length / sizeof(WCHAR),
@@ -182,7 +235,7 @@ int main(){
         InitializeObjectAttributes(&objAttri, NULL, 0, NULL, NULL);
             
         CLIENT_ID clientID = {0};
-        clientID.UniqueProcess = (HANDLE)(ULONG_PTR)pid;//Don't forget to check this output
+        clientID.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
         clientID.UniqueThread = NULL;
         
         //OpenProcess [entry]
