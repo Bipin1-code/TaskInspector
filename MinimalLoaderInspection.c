@@ -8,12 +8,15 @@
 
 #include <stdio.h>
 #include <windows.h>
+#include <winnt.h>
 
 #ifdef _M_X64
 #define GET_PEB() ((PEB*)__readgsqword(0x60))
 #else
 #define GET_PEB() ((PEB*)__readfsdword(0x30))
 #endif
+
+#define RVA_TO_VA(base, rva) ((void *)((BYTE*)(base) + (rva)))
 
 #define field_offset(type, field) \
     ((size_t)&(((type *)0)->field))
@@ -66,9 +69,164 @@ typedef struct PEB{
     PEB_LDR_DATA *Ldr; //this gives loader info
 } PEB;
 
+//Relocation dump function
+void DumpRelocations(void *moduleBase){
+    //What this line represent?
+    /* This points to the very first bytes of the PE image in memory.
+       Every PE starts with: MZ (That's the DOS header).
+       Why do we care?
+       Because DOS header contains: dos->e_lfanew
+       Which means: "Offset to the real PE header"
+       Think of it like: "DOS stub -> PE header pointer"
+     */
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)moduleBase;
+
+    //What this line represent?
+    /* (BYTE *)moduleBase => treat base  as raw byte
+        + dos->e_lfanew   => jump to where PE header starts
+        cast to IMAGE_NT_HEADERS64 => now we can read PE metadata
+        This structure contains:
+         1. OptionalHeader, 2. DataDirectory, 3. ImageBase, 4. Section layout
+         This is where relocations are described.
+    */
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)moduleBase + dos->e_lfanew);
+
+    //this is where relocation live
+    IMAGE_DATA_DIRECTORY *relocDir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+    if(!relocDir->VirtualAddress || !relocDir->Size){
+        printf("No relocation table\n");
+        return;
+    }
+
+    //We get virtual address  with modulebase and relocationDir virtaul Address
+    BYTE *relocBase = RVA_TO_VA(moduleBase, relocDir->VirtualAddress);
+
+    //relocationEND =  RVA + relocationDir size
+    BYTE *relocEnd = relocBase + relocDir->Size;
+
+    printf("\n Base Relocations: \n");
+    while(relocBase < relocEnd){
+        //Each block means: "fixups for one 4KB page"
+        IMAGE_BASE_RELOCATION *block = (IMAGE_BASE_RELOCATION *)relocBase;
+        
+        //Number of entries
+        DWORD count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+
+        WORD *entries = (WORD *)(block + 1);
+
+        for(DWORD i = 0; i < count; i++){
+            
+            WORD type = entries[i] >> 12;
+            WORD offset = entries[i] & 0x0FFF;
+
+            if(type == IMAGE_REL_BASED_DIR64){
+                //Relocation entry = (Actual mapped Base + PageRVA + Offset inside page)
+                void *fixup = (BYTE *)moduleBase + block->VirtualAddress + offset;
+                printf("Fixup @ %p\n", fixup);
+            }
+        }
+        relocBase += block->SizeOfBlock;
+    }
+}
+
+void DumpEAT(void *moduleBase){
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)moduleBase;
+
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)moduleBase + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY *expDir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+    if(!expDir->VirtualAddress){
+        printf("No exports\n");
+        return;
+    }
+
+    IMAGE_EXPORT_DIRECTORY *exp = (IMAGE_EXPORT_DIRECTORY *)((BYTE *)moduleBase + expDir->VirtualAddress);
+
+    DWORD *funcRVAs = (DWORD *)((BYTE *)moduleBase + exp->AddressOfFunctions);
+    DWORD *namesRVAs = (DWORD *)((BYTE *)moduleBase + exp->AddressOfNames);
+    WORD *ordinals = (WORD *)((BYTE *)moduleBase + exp->AddressOfNameOrdinals);
+
+    printf("\n\n[EAT] Exports: \n");
+    for(DWORD i = 0; i < exp->NumberOfNames; i++){
+        char *name = (char *)moduleBase + namesRVAs[i];
+        WORD ordIndex = ordinals[i];
+        void *funcAddr = (BYTE *)moduleBase + funcRVAs[ordIndex];
+
+        printf("  %s -> %p\n", name, funcAddr);
+    }
+}
+
+BOOL IsAddressInKnownModule(void *addr){
+    PEB *peb = GET_PEB();
+    M_LIST_ENTRY *head = &peb->Ldr->InMemoryOrderModuleList;
+    M_LIST_ENTRY *e = head->Flink;
+    LIST_FOR_EACH(e, head){
+        LDR_DATA_TABLE_ENTRY *mod =
+            CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLink);
+
+        BYTE *start = (BYTE *)mod->DllBase;
+        BYTE *end   = start + mod->SizeOfImage;
+
+        if ((BYTE *)addr >= start && (BYTE *)addr < end)
+            return TRUE;
+    }
+    return FALSE;
+}
+C
+void DumpIAT(void *moduleBase){
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)moduleBase;
+
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)moduleBase + dos->e_lfanew);
+
+    IMAGE_DATA_DIRECTORY *impDir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+    if(!impDir->VirtualAddress){
+        printf("No imports\n");
+        return;
+    }
+
+    //Import Table
+    IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)((BYTE *)moduleBase + impDir->VirtualAddress);
+    printf("\n\n[IAT] Imports:\n");
+
+    //Walking import descriptors 
+    for(; desc->Name; desc++){
+        char *dllName = (char *)moduleBase + desc->Name;
+        printf("\nDLL: %s\n", dllName);
+
+        
+        //OriginalFirstThunk = Import Lookup Table (ILT), [Exist on disk]
+        IMAGE_THUNK_DATA64 *origThunk = (IMAGE_THUNK_DATA64 *)((BYTE *)moduleBase + desc->OriginalFirstThunk);
+
+        //FirstThunk = Import Address Table (IAT), [Exist in memory]
+        IMAGE_THUNK_DATA64 *iatThunk = (IMAGE_THUNK_DATA64 *)((BYTE *)moduleBase + desc->FirstThunk);
+
+        //walking function by function
+        for(; origThunk->u1.AddressOfData; origThunk++, iatThunk++){
+            if(origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64){
+                //Imported by Ordinal
+                printf("  Oridnal -> %p\n", (void *)iatThunk->u1.Function);
+                continue;
+            }
+
+            IMAGE_IMPORT_BY_NAME *name = (IMAGE_IMPORT_BY_NAME *)((BYTE *)moduleBase + origThunk->u1.AddressOfData);
+
+            void *resolved = (void *)iatThunk->u1.Function;
+            printf("  %s  -> %p", name->Name, resolved);
+
+            // Hook detection
+            if(!IsAddressInKnownModule(resolved)){
+                printf(" [HOOKED] ");
+            }
+         
+            printf("\n");
+        }
+    }
+}
 
 int main(){
-
+    //LoadLibraryA("user32.dll");
     PEB *peb = GET_PEB();
     PEB_LDR_DATA *ldr = peb->Ldr;
 
@@ -77,19 +235,27 @@ int main(){
     M_LIST_ENTRY *memHead = &ldr->InMemoryOrderModuleList;
     M_LIST_ENTRY *memCurr = memHead->Flink;
     
-    printf("Loaded Modules (LOAD Order):\n\
-Who Entered the process, and when?\n");
+    printf("Loaded Modules (LOAD Order):\n Who Entered the process, and when?\n");
     LIST_FOR_EACH(mCurr, mHead){
         LDR_DATA_TABLE_ENTRY *entry =
-            container_of(mCurr, LDR_DATA_TABLE_ENTRY, InLoadOrderLink); 
+            container_of(mCurr, LDR_DATA_TABLE_ENTRY, InLoadOrderLink);
+
+        if(wcscmp(entry->BaseDllName.Buffer, L"mLI.exe") == 0){
+            DumpRelocations(entry->DllBase);
+            DumpEAT(entry->DllBase);
+        }
+         if(wcscmp(entry->BaseDllName.Buffer, L"KERNEL32.DLL") == 0){
+            DumpEAT(entry->DllBase);
+            DumpIAT(entry->DllBase);
+        }
+        
         wprintf(L"Base: %p Name: %ls SizeOfImage: %lu\n",
                 entry->DllBase,
                 entry->BaseDllName.Buffer,
                 entry->SizeOfImage);
     }
 
-    printf("\n\nMemory Modules (Memory Order):\n\
-Who lives where in VA space?\n");
+    printf("\n\nMemory Modules (Memory Order):\n Who lives where in VA space?\n");
     LIST_FOR_EACH(memCurr, memHead){
         LDR_DATA_TABLE_ENTRY *entry =
             container_of(memCurr, LDR_DATA_TABLE_ENTRY, InMemoryOrderLink);
@@ -99,8 +265,7 @@ Who lives where in VA space?\n");
                 entry->SizeOfImage);
     }
 
-    printf("\n\nInitialization Modules (Initialization Order):\n\
-Who was ready before whom?\n");
+    printf("\n\nInitialization Modules (Initialization Order):\n Who was ready before whom?\n");
     M_LIST_ENTRY *iHead = &ldr->InInitializationOrderModuleList;
     M_LIST_ENTRY *curr = mHead->Flink;
     LIST_FOR_EACH(curr, iHead){
@@ -112,36 +277,7 @@ Who was ready before whom?\n");
                 e->BaseDllName.Buffer,
                 e->SizeOfImage);
     }
-
-
+    
     getchar();
     return 0;
 }
-
-/*Output:
-Loaded Modules (LOAD Order):
-Who Entered the process, and when?
-Base: 00007ff6776d0000 Name: mLI.exe SizeOfImage: 266240
-Base: 00007ffce6f60000 Name: ntdll.dll SizeOfImage: 2519040
-Base: 00007ffce69e0000 Name: KERNEL32.DLL SizeOfImage: 823296
-Base: 00007ffce42e0000 Name: KERNELBASE.dll SizeOfImage: 4124672
-Base: 00007ffce6c80000 Name: msvcrt.dll SizeOfImage: 692224
-
-
-Memory Modules (Memory Order):
-Who lives where in VA space?
-Memory Base: 00007ff6776d0000 Name: mLI.exe SizeOfImage: 266240
-Memory Base: 00007ffce6f60000 Name: ntdll.dll SizeOfImage: 2519040
-Memory Base: 00007ffce69e0000 Name: KERNEL32.DLL SizeOfImage: 823296
-Memory Base: 00007ffce42e0000 Name: KERNELBASE.dll SizeOfImage: 4124672
-Memory Base: 00007ffce6c80000 Name: msvcrt.dll SizeOfImage: 692224
-
-
-Initialization Modules (Initialization Order):
-Who was ready before whom?
-Memory Base: 00007ffce6f60000 Name: ntdll.dll  SizeOfImage: 2519040
-Memory Base: 00007ffce42e0000 Name: KERNELBASE.dll  SizeOfImage: 4124672
-Memory Base: 00007ffce69e0000 Name: KERNEL32.DLL  SizeOfImage: 823296
-Memory Base: 00007ffce6c80000 Name: msvcrt.dll  SizeOfImage: 692224
-
- */
